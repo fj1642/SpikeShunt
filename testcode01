@@ -1,0 +1,76 @@
+"""
+Test the hybrid ANN/SNN builder (build_hybrid.py) on a real dataset instead
+of random noise: scikit-learn's digits dataset -- 1797 8x8 grayscale images
+of handwritten digits 0-9, 64 features, 10 classes. Ships inside
+scikit-learn, no download needed.
+
+Why this matters more than the random-input demo: the profiler's swap
+decisions depend entirely on measured activation sparsity, and an
+untrained network fed uniform random noise doesn't produce the same
+sparsity pattern a real trained classifier does. So this script actually
+trains the baseline ANN first, then runs the SAME build_hybrid() from
+build_hybrid.py on its real activations, and reports the metric that
+actually matters for a deployment decision: classification accuracy,
+ANN vs hybrid -- not just output correlation on meaningless data.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+
+
+def load_data():
+    data = load_digits()
+    X = data.data.astype("float32") / 16.0          # pixel intensity 0..16 -> [0,1]
+    y = data.target.astype("int64")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=0, stratify=y
+    )
+    return (
+        torch.from_numpy(X_train), torch.from_numpy(y_train),
+        torch.from_numpy(X_test), torch.from_numpy(y_test),
+    )
+
+
+def train_ann(ann, X_train, y_train, epochs=300, lr=1e-2):
+    opt = torch.optim.Adam(ann.parameters(), lr=lr)
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = F.cross_entropy(ann(X_train), y_train)
+        loss.backward()
+        opt.step()
+    return ann
+
+
+@torch.no_grad()
+def accuracy(model, X, y):
+    return (model(X).argmax(dim=1) == y).float().mean().item()
+
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    X_train, y_train, X_test, y_test = load_data()
+    n_classes = int(y_train.max().item()) + 1
+    print(f"digits dataset: {X_train.shape[0]} train / {X_test.shape[0]} test, "
+          f"{X_train.shape[1]} features, {n_classes} classes")
+
+    ann = nn.Sequential(
+        nn.Linear(64, 128), nn.ReLU(),
+        nn.Linear(128, 64), nn.ReLU(),
+        nn.Linear(64, 32), nn.ReLU(),
+        nn.Linear(32, 10),               # raw logits head -- no ReLU, never an SNN candidate
+    )
+    train_ann(ann, X_train, y_train)
+    ann_acc = accuracy(ann, X_test, y_test)
+    print(f"\nbaseline ANN test accuracy: {ann_acc:.3f}")
+
+    print("\n=== building hybrid (metric=effective_ops, T=5, calibrated on the training set) ===")
+    hybrid, decisions = build_hybrid(ann, X_train, T=5, metric="effective_ops", min_fidelity=0.5)
+
+    hybrid_acc = accuracy(hybrid, X_test, y_test)
+    print(f"\nbaseline ANN accuracy:  {ann_acc:.3f}")
+    print(f"hybrid accuracy:        {hybrid_acc:.3f}")
+    print(f"chance baseline:        {1 / n_classes:.3f}")
+    print("layer decisions:", [d["chosen"] for d in decisions])
