@@ -1,0 +1,203 @@
+
+import copy
+import time
+ 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+ 
+ 
+# ----------------------------------------------------------------------
+# 1. SNN-equivalent block: rate-code the input, run T-step LIF, decode
+# ----------------------------------------------------------------------
+ 
+class SNNBlock(nn.Module):
+    """Drop-in replacement for one (Linear, ReLU) block. Encodes the
+    block's input as a Bernoulli spike train over T steps (probability =
+    input scaled into [0,1] by a per-block calibration constant),
+    integrates the spikes through a LIF neuron using the SAME weights as
+    the Linear it replaces, and decodes the output as spike-count / T."""
+ 
+    def __init__(self, linear: nn.Linear, T=25, v_th=0.1, tau_m=5.0):
+        super().__init__()
+        self.linear = linear
+        self.T = T
+        self.v_th = v_th
+        self.register_buffer("decay", torch.exp(torch.tensor(-1.0 / tau_m)))
+        self.register_buffer("in_scale", torch.tensor(1.0))   # set by calibrate_scale()
+ 
+    @torch.no_grad()
+    def calibrate_scale(self, calib_x, percentile=99.0):
+        p = torch.quantile(calib_x.clamp(min=0).flatten(), percentile / 100.0)
+        self.in_scale.fill_(p.clamp(min=1e-3).item())
+ 
+    def forward(self, x):
+        p = (x / self.in_scale).clamp(0, 1)             # input -> per-step spike probability
+        batch = x.shape[0]
+        out_f = self.linear.out_features
+        v = torch.zeros(batch, out_f, device=x.device)
+        spike_count = torch.zeros(batch, out_f, device=x.device)
+        # exact LIF integration per step (see the discretization note in
+        # spike_shunt.py -- same fix applied here: decay + I*(1-decay))
+        gain = 1.0 - self.decay
+        for _ in range(self.T):
+            spikes_in = torch.bernoulli(p)
+            current = F.linear(spikes_in, self.linear.weight, self.linear.bias)
+            v = v * self.decay + current * gain
+            spiked = (v >= self.v_th).float()
+            spike_count = spike_count + spiked
+            v = v * (1 - spiked)
+        return spike_count / self.T
+ 
+ 
+# ----------------------------------------------------------------------
+# 2. Profiling: benchmark one block both ways
+# ----------------------------------------------------------------------
+ 
+@torch.no_grad()
+def profile_block(linear: nn.Linear, x, T=25, repeats=10):
+    """Benchmark one (Linear, ReLU) block as dense ANN vs rate-coded SNN
+    with identical weights. Returns measured latency, an effective-ops
+    estimate for each, and each path's output (so the chain can keep
+    flowing with whichever gets chosen upstream)."""
+    batch, in_f = x.shape
+    out_f = linear.out_features
+ 
+    # -- ANN path --
+    ann_block = nn.Sequential(linear, nn.ReLU())
+    for _ in range(3):
+        ann_block(x)                                    # warm-up
+    t0 = time.perf_counter()
+    for _ in range(repeats):
+        ann_out = ann_block(x)
+    t_ann = (time.perf_counter() - t0) / repeats
+    ann_ops = batch * in_f * out_f
+ 
+    # -- SNN path --
+    snn_block = SNNBlock(linear, T=T)
+    snn_block.calibrate_scale(x)
+    for _ in range(3):
+        snn_block(x)                                     # warm-up
+    t0 = time.perf_counter()
+    for _ in range(repeats):
+        snn_out = snn_block(x)
+    t_snn = (time.perf_counter() - t0) / repeats
+ 
+    p = (x / snn_block.in_scale).clamp(0, 1)
+    spike_density = p.mean().item()
+    snn_ops = batch * in_f * out_f * T * spike_density
+ 
+    # fidelity: does the SNN block's output actually track the ANN block's
+    # output, or is it degenerate (e.g. dead -- all zero because nothing
+    # ever crossed threshold)? A block that is "free" only because it
+    # outputs nothing is not a real win.
+    a, s = ann_out.flatten(), snn_out.flatten()
+    if a.std() > 1e-8 and s.std() > 1e-8:
+        fidelity = torch.corrcoef(torch.stack([a, s]))[0, 1].item()
+    else:
+        fidelity = 0.0                                  # one side is constant -> no real signal
+ 
+    return {
+        "ann_time": t_ann, "snn_time": t_snn,
+        "ann_ops": ann_ops, "snn_ops": snn_ops,
+        "spike_density": spike_density, "fidelity": fidelity,
+        "ann_out": ann_out, "snn_out": snn_out,
+    }
+ 
+ 
+# ----------------------------------------------------------------------
+# 3. Build the hybrid: decide per block, swap, reassemble
+# ----------------------------------------------------------------------
+ 
+class HybridANN(nn.Module):
+    def __init__(self, blocks: nn.ModuleList):
+        super().__init__()
+        self.blocks = blocks
+ 
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
+ 
+ 
+def build_hybrid(ann: nn.Sequential, calib_x, T=25, metric="latency", margin=0.0,
+                  min_fidelity=0.5, verbose=True):
+    """Walk an ANN of alternating (Linear, ReLU) pairs. For each pair,
+    profile dense-ANN vs rate-coded-SNN (same weights) and keep the SNN
+    only if BOTH hold:
+      1. it is cheaper under `metric` ("latency" or "effective_ops")
+      2. its output actually correlates with the ANN's (fidelity >= min_fidelity)
+    Condition 2 exists so a degenerate/dead SNN block (outputs ~0 because
+    nothing crossed threshold) can't win just by doing no work -- that's
+    not a faster layer, it's a broken one.
+    Returns (hybrid_model, decisions) -- one entry per block with the
+    measurements and the choice made, so you can see exactly why."""
+    linears = [m for m in ann if isinstance(m, nn.Linear)]
+    blocks = nn.ModuleList()
+    decisions = []
+    x = calib_x
+    for idx, linear in enumerate(linears):
+        stats = profile_block(linear, x, T=T)
+        if metric == "latency":
+            cheaper = stats["snn_time"] < stats["ann_time"] * (1 - margin)
+        elif metric == "effective_ops":
+            cheaper = stats["snn_ops"] < stats["ann_ops"] * (1 - margin)
+        else:
+            raise ValueError(f"unknown metric: {metric}")
+        faithful = stats["fidelity"] >= min_fidelity
+        use_snn = cheaper and faithful
+ 
+        if use_snn:
+            block = SNNBlock(copy.deepcopy(linear), T=T)
+            block.calibrate_scale(x)
+            x = block(x)
+        else:
+            block = nn.Sequential(copy.deepcopy(linear), nn.ReLU())
+            x = block(x)                                  # always advance with the ANN path's
+                                                            # numerics when SNN is rejected, so
+                                                            # downstream profiling sees real data
+        blocks.append(block)
+ 
+        if use_snn:
+            chosen = "SNN"
+        elif cheaper and not faithful:
+            chosen = "ANN (SNN was cheaper but degenerate/low-fidelity)"
+        else:
+            chosen = "ANN"
+        decisions.append({
+            "layer": idx, "shape": (linear.in_features, linear.out_features),
+            "ann_time_ms": stats["ann_time"] * 1000, "snn_time_ms": stats["snn_time"] * 1000,
+            "ann_ops": stats["ann_ops"], "snn_ops": stats["snn_ops"],
+            "spike_density": stats["spike_density"], "fidelity": stats["fidelity"],
+            "chosen": chosen,
+        })
+        if verbose:
+            print(f"layer {idx} ({linear.in_features:>4}->{linear.out_features:<4}): "
+                  f"ANN {stats['ann_time']*1000:7.3f}ms / SNN {stats['snn_time']*1000:7.3f}ms   "
+                  f"ANN {stats['ann_ops']:>9.0f} ops / SNN~{stats['snn_ops']:>9.0f} ops "
+                  f"(density {stats['spike_density']:.2f}, fidelity {stats['fidelity']:.2f})  -> {chosen}")
+ 
+    return HybridANN(blocks), decisions
+ 
+ 
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    ann = nn.Sequential(
+        nn.Linear(256, 128), nn.ReLU(),
+        nn.Linear(128, 64), nn.ReLU(),
+        nn.Linear(64, 32), nn.ReLU(),
+        nn.Linear(32, 10), nn.ReLU(),
+    )
+    calib_x = torch.rand(64, 256)
+ 
+    print("=== metric: latency (real wall-clock, T=25) ===")
+    hybrid_lat, dec_lat = build_hybrid(ann, calib_x, T=25, metric="latency")
+ 
+    print("\n=== metric: effective_ops (sparse/event-driven proxy, T=5) ===")
+    hybrid_ops, dec_ops = build_hybrid(ann, calib_x, T=5, metric="effective_ops", min_fidelity=0.5)
+ 
+    print("\nHybrid (effective_ops) forward check:")
+    out = hybrid_ops(calib_x)
+    print("output shape:", tuple(out.shape))
+ 
