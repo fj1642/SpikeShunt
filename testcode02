@@ -1,0 +1,77 @@
+"""
+Test the hybrid ANN/SNN builder on a second real dataset: scikit-learn's
+breast cancer dataset (569 samples, 30 features, 2 classes, built in --
+no download needed).
+
+Picked specifically because digits (test_with_digits.py) was a null
+result at the default T=5: real activation density there never cleared
+the swap bar, so hybrid accuracy == baseline accuracy, exactly. That's
+an honest result but not a useful one for seeing the tradeoff move.
+Breast cancer's hidden layers run sparser, so a T sweep here actually
+crosses the bar at a reasonable T (not an extreme T=2) and you can watch
+accuracy move layer by layer as more of the network gets swapped.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+
+
+
+
+def load_data():
+    data = load_breast_cancer()
+    X = data.data.astype("float32")
+    X = (X - X.min(0)) / (X.max(0) - X.min(0) + 1e-8)     # per-feature min-max -> [0,1]
+    y = data.target.astype("int64")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=0, stratify=y
+    )
+    return (
+        torch.from_numpy(X_train), torch.from_numpy(y_train),
+        torch.from_numpy(X_test), torch.from_numpy(y_test),
+    )
+
+
+def train_ann(ann, X_train, y_train, epochs=300, lr=1e-2):
+    opt = torch.optim.Adam(ann.parameters(), lr=lr)
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = F.cross_entropy(ann(X_train), y_train)
+        loss.backward()
+        opt.step()
+    return ann
+
+
+@torch.no_grad()
+def accuracy(model, X, y):
+    return (model(X).argmax(dim=1) == y).float().mean().item()
+
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    X_train, y_train, X_test, y_test = load_data()
+    print(f"breast cancer dataset: {X_train.shape[0]} train / {X_test.shape[0]} test, "
+          f"{X_train.shape[1]} features, 2 classes")
+
+    ann = nn.Sequential(
+        nn.Linear(30, 64), nn.ReLU(),
+        nn.Linear(64, 32), nn.ReLU(),
+        nn.Linear(32, 16), nn.ReLU(),
+        nn.Linear(16, 2),                  # raw logits head -- no ReLU, never an SNN candidate
+    )
+    train_ann(ann, X_train, y_train)
+    ann_acc = accuracy(ann, X_test, y_test)
+    print(f"\nbaseline ANN test accuracy: {ann_acc:.3f}")
+
+    print("\n=== sweeping T: watch accuracy move as more layers clear the swap bar ===")
+    for T in (3, 4, 5, 6, 8):
+        hybrid, decisions = build_hybrid(ann, X_train, T=T, metric="effective_ops",
+                                          min_fidelity=0.5, verbose=False)
+        hybrid_acc = accuracy(hybrid, X_test, y_test)
+        swapped = [d["layer"] for d in decisions if d["chosen"] == "SNN"]
+        print(f"T={T:>2}: swapped layers {swapped or '(none)'}  "
+              f"-> hybrid accuracy {hybrid_acc:.3f}  (baseline {ann_acc:.3f}, "
+              f"delta {hybrid_acc - ann_acc:+.3f})")
